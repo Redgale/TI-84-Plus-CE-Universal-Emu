@@ -1,0 +1,88 @@
+{
+  "name": "ti84ce-web-emulator",
+  "version": "0.1.0",
+  "description": "A portable TI-84 Plus CE emulator powered by CEmu WebAssembly.",
+  "author": "TI-84 CE Web Emulator contributors",
+  "private": true,
+  "engines": {
+    "node": ">=22.13.0"
+  },
+  "scripts": {
+    "install:ci": "bash scripts/install-ci.sh",
+    "dev": "WRANGLER_LOG_PATH=.wrangler/wrangler.log vite",
+    "build": "bash scripts/build-verified.sh",
+    "build:portable": "vite build --config vite.portable.config.ts",
+    "typecheck:portable": "tsc -p tsconfig.portable.json --noEmit --incremental false",
+    "preview:portable": "vite preview --config vite.portable.config.ts",
+    "electron:dev": "npm run build:portable && electron electron/main.js",
+    "electron:pack": "npm run build:portable && electron-builder --dir",
+    "electron:dist": "npm run build:portable && electron-builder",
+    "ios:add": "npm run build:portable && cap add ios",
+    "ios:sync": "npm run build:portable && cap sync ios",
+    "ios:open": "cap open ios",
+    "start": "WRANGLER_LOG_PATH=.wrangler/wrangler.log vinext start",
+    "test": "npm run build && node --test tests/rendered-html.test.mjs",
+    "validate:artifact": "bash scripts/validate-artifact.sh",
+    "lint": "bash scripts/sites-env.sh -- eslint . --ignore-pattern dist --ignore-pattern dist-portable --ignore-pattern ios/App/App/public --ignore-pattern release --ignore-pattern .next",
+    "db:generate": "bash scripts/sites-env.sh -- drizzle-kit generate"
+  },
+  "dependencies": {
+    "@capacitor/core": "8.5.0",
+    "@capacitor/ios": "8.5.0",
+    "drizzle-orm": "0.45.2",
+    "next": "16.2.6",
+    "react": "19.2.6",
+    "react-dom": "19.2.6"
+  },
+  "devDependencies": {
+    "@capacitor/cli": "8.5.0",
+    "@cloudflare/vite-plugin": "1.37.1",
+    "@tailwindcss/postcss": "4.2.1",
+    "@types/node": "22.19.19",
+    "@types/react": "19.2.14",
+    "@types/react-dom": "19.2.3",
+    "@vitejs/plugin-react": "6.0.2",
+    "@vitejs/plugin-rsc": "0.5.26",
+    "drizzle-kit": "0.31.10",
+    "electron": "43.3.0",
+    "electron-builder": "26.15.3",
+    "eslint": "9.39.4",
+    "eslint-config-next": "16.2.6",
+    "react-server-dom-webpack": "19.2.6",
+    "tailwindcss": "4.2.1",
+    "typescript": "5.9.3",
+    "vinext": "0.0.50",
+    "vite": "8.0.13",
+    "wrangler": "4.92.0"
+  },
+  "type": "module",
+  "main": "electron/main.js",
+  "desktopName": "com.redgale.ti84ce.desktop",
+  "displayName": "TI-84 CE Web Emulator",
+  "build": {
+    "appId": "com.redgale.ti84ce",
+    "productName": "TI-84 CE Emulator",
+    "directories": {
+      "output": "release"
+    },
+    "files": [
+      "dist-portable/**/*",
+      "electron/**/*",
+      "package.json",
+      "!node_modules/**/*"
+    ],
+    "asar": true,
+    "linux": {
+      "target": ["AppImage"],
+      "category": "Education",
+      "syncDesktopName": true
+    },
+    "mac": {
+      "target": ["dmg", "zip"],
+      "category": "public.app-category.education"
+    },
+    "win": {
+      "target": ["nsis", "portable"]
+    }
+  }
+}
