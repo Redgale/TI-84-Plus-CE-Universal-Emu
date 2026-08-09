@@ -1,0 +1,83 @@
+name: Build iOS IPA
+
+on:
+  workflow_dispatch:
+  push:
+    tags:
+      - "v*"
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ios-ipa-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  build-unsigned-ipa:
+    name: Build unsigned IPA
+    runs-on: macos-26
+    timeout-minutes: 30
+
+    steps:
+      - name: Check out source
+        uses: actions/checkout@v7
+
+      - name: Set up Node.js
+        uses: actions/setup-node@v7
+        with:
+          node-version: "22.13.0"
+          cache: npm
+
+      - name: Install dependencies
+        run: npm ci
+
+      - name: Build and sync the iOS project
+        run: npm run ios:sync
+
+      - name: Show Apple toolchain versions
+        run: |
+          xcodebuild -version
+          xcode-select -p
+
+      - name: Build the unsigned device app
+        run: |
+          set -euo pipefail
+          xcodebuild \
+            -project ios/App/App.xcodeproj \
+            -scheme App \
+            -configuration Release \
+            -sdk iphoneos \
+            -destination "generic/platform=iOS" \
+            -derivedDataPath build/ios-derived \
+            CODE_SIGNING_ALLOWED=NO \
+            CODE_SIGNING_REQUIRED=NO \
+            CODE_SIGN_IDENTITY="" \
+            build
+
+      - name: Package the IPA
+        run: |
+          set -euo pipefail
+          app_path="build/ios-derived/Build/Products/Release-iphoneos/App.app"
+          output_dir="build/ipa"
+          ipa_name="TI-84-CE-Emulator-unsigned.ipa"
+
+          test -d "$app_path"
+          mkdir -p "$output_dir/Payload"
+          ditto "$app_path" "$output_dir/Payload/App.app"
+          (
+            cd "$output_dir"
+            /usr/bin/zip -qry "$ipa_name" Payload
+          )
+          shasum -a 256 "$output_dir/$ipa_name" > "$output_dir/$ipa_name.sha256"
+
+      - name: Upload IPA artifact
+        uses: actions/upload-artifact@v7
+        with:
+          name: ti84ce-ios-unsigned-${{ github.run_number }}
+          path: |
+            build/ipa/TI-84-CE-Emulator-unsigned.ipa
+            build/ipa/TI-84-CE-Emulator-unsigned.ipa.sha256
+          if-no-files-found: error
+          compression-level: 0
+          retention-days: 30
