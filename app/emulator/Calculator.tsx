@@ -1,0 +1,1706 @@
+"use client";
+
+import { useEffect, useMemo, useRef, useState, useCallback } from "react";
+import {
+  createBackend,
+  type EmulatorBackend,
+  type BackendType,
+} from "./emulator";
+import { Keypad } from "./components/keypad";
+import {
+  BODY_ASPECT_RATIO,
+  LCD_POSITION,
+} from "./components/keypad/buttonRegions";
+import { getStateStorage, type StateStorage } from "./storage/StateStorage";
+import { publicAsset } from "./assets/publicAsset";
+
+// Lazy-load ROM module - not downloaded until needed
+async function loadBundledRom(): Promise<Uint8Array | null> {
+  try {
+    const { decodeRom } = await import("./assets/rom");
+    return await decodeRom();
+  } catch {
+    // ROM module failed to load
+  }
+  return null;
+}
+
+// TI-84 Plus CE keypad layout (matches iOS KeypadView.swift)
+// Maps keyboard keys to [row, col] positions
+const KEY_MAP: Record<string, [number, number]> = {
+  // Function keys (row 1)
+  F1: [1, 4], // Y=
+  F2: [1, 3], // Window
+  F3: [1, 2], // Zoom
+  F4: [1, 1], // Trace
+  F5: [1, 0], // Graph
+  // Shift (2nd) handled specially - only triggers on release if no other key pressed
+  Escape: [6, 6], // Clear
+  Backspace: [1, 7], // Del
+  Delete: [1, 7], // Del
+
+  // Row 2: on, sto, ln, log, x², x⁻¹, math, alpha
+  o: [2, 0], // ON
+  O: [2, 0], // ON
+  Insert: [2, 1], // Sto
+  l: [2, 2], // Ln
+  L: [2, 2], // Ln
+  g: [2, 3], // Log
+  G: [2, 3], // Log
+  r: [2, 5], // x⁻¹
+  R: [2, 5], // x⁻¹
+  m: [2, 6], // Math
+  M: [2, 6], // Math
+  Alt: [2, 7], // Alpha
+
+  // Row 3: 0, 1, 4, 7, comma, sin, apps, X,T,θ,n
+  "0": [3, 0],
+  "1": [3, 1],
+  "4": [3, 2],
+  "7": [3, 3],
+  ",": [3, 4],
+  s: [3, 5], // Sin
+  S: [3, 5], // Sin
+  Home: [3, 6], // Apps
+  x: [3, 7], // X,T,θ,n
+  X: [3, 7], // X,T,θ,n
+
+  // Row 4: ., 2, 5, 8, (, cos, prgm, stat
+  ".": [4, 0],
+  "2": [4, 1],
+  "5": [4, 2],
+  "8": [4, 3],
+  "(": [4, 4],
+  c: [4, 5], // Cos
+  C: [4, 5], // Cos
+  p: [4, 6], // Prgm
+  P: [4, 6], // Prgm
+  PageDown: [4, 6], // Prgm
+  End: [4, 7], // Stat
+
+  // Row 5: (-), 3, 6, 9, ), tan, vars
+  _: [5, 0], // (-)
+  "3": [5, 1],
+  "6": [5, 2],
+  "9": [5, 3],
+  ")": [5, 4],
+  t: [5, 5], // Tan
+  T: [5, 5], // Tan
+  PageUp: [5, 6], // Vars
+
+  // Row 6: enter, +, -, ×, ÷, ^, clear
+  Enter: [6, 0],
+  "+": [6, 1],
+  "-": [6, 2],
+  "*": [6, 3], // ×
+  "/": [6, 4], // ÷
+  "^": [6, 5],
+  Clear: [6, 6],
+
+  // Row 7: D-pad (down, left, right, up)
+  ArrowDown: [7, 0],
+  ArrowLeft: [7, 1],
+  ArrowRight: [7, 2],
+  ArrowUp: [7, 3],
+};
+
+interface CalculatorProps {
+  className?: string;
+  defaultBackend?: BackendType;
+  useBundledRom?: boolean;
+  fullscreen?: boolean;
+  defaultSpeedIndex?: number;
+  customRomLoader?: () => Promise<Uint8Array | null>;
+  autoLaunch?: boolean;
+}
+
+const MIN_KEY_HOLD_FRAMES = 3;
+const MIN_KEY_GAP_FRAMES = 1;
+const COMMAND_KEY_GAP_FRAMES = 7;
+const PROGRAM_EXTENSIONS = [
+  ".8xp", ".8xv", ".8xl", ".8xn", ".8xm", ".8xy", ".8xg", ".8xs",
+  ".8xd", ".8xw", ".8xc", ".8xz", ".8xt", ".8ca", ".8cg", ".8ci",
+  ".8ek", ".8yu", ".8eu", ".8pu",
+];
+const ROM_EXTENSIONS = [".rom", ".bin"];
+
+interface ActiveKeyPress {
+  id: string;
+  row: number;
+  col: number;
+  backend: EmulatorBackend;
+  framesHeld: number;
+  releaseRequested: boolean;
+}
+
+export function Calculator({
+  className,
+  defaultBackend = "cemu",
+  useBundledRom = false,
+  fullscreen = false,
+  defaultSpeedIndex = 3,
+  customRomLoader,
+  autoLaunch,
+}: CalculatorProps) {
+  const canvasRef = useRef<HTMLCanvasElement>(null);
+  const backendRef = useRef<EmulatorBackend | null>(null);
+  const animationRef = useRef<number>(0);
+  const [backendType, setBackendType] = useState<BackendType>(defaultBackend);
+  const [isRunning, setIsRunning] = useState(false);
+  const [romLoaded, setRomLoaded] = useState(false);
+  const [error, setError] = useState<string | null>(null);
+  const [initialized, setInitialized] = useState(false);
+  const [fps, setFps] = useState(0);
+  const [backendName, setBackendName] = useState("");
+  const [transferStatus, setTransferStatus] = useState<string | null>(null);
+  // Non-linear speed steps: 0.25-2.5 by 0.25, 3-10 by 0.5, 11-20 by 1
+  const speedSteps = useMemo(() => {
+    const steps: number[] = [];
+    for (let s = 0.25; s <= 2.5; s += 0.25) steps.push(s);
+    for (let s = 3; s <= 10; s += 0.5) steps.push(s);
+    for (let s = 11; s <= 20; s += 1) steps.push(s);
+    return steps;
+  }, []);
+  const [speedIndex, setSpeedIndex] = useState(defaultSpeedIndex); // index 3 = 1x (default)
+  const speed = speedSteps[speedIndex];
+  const [programFiles, setProgramFiles] = useState<string[]>([]); // Names of loaded .8xp/.8xv files
+  const [isDragging, setIsDragging] = useState(false);
+  const dragCounterRef = useRef(0);
+  const lastFrameTime = useRef(0);
+  const frameCount = useRef(0);
+  const romDataRef = useRef<Uint8Array | null>(null);
+  const programDataRef = useRef<{ name: string; data: Uint8Array }[]>([]); // Loaded program file data
+  const programHandlesRef = useRef<FileSystemFileHandle[]>([]); // File handles for re-reading from disk
+  const speedRef = useRef(1); // Ref for use in animation loop
+  const turboUntilRef = useRef(0); // Timestamp: turbo-speed until this time (for fast boot after live send)
+  const storageRef = useRef<StateStorage | null>(null);
+  const romHashRef = useRef<string | null>(null);
+  const backendTypeRef = useRef<BackendType>(defaultBackend);
+  const programInputRef = useRef<HTMLInputElement>(null);
+  const activeKeysRef = useRef<Map<string, ActiveKeyPress[]>>(new Map());
+  const inputQueueRef = useRef<ActiveKeyPress[]>([]);
+  const currentInputRef = useRef<ActiveKeyPress | null>(null);
+  const inputGapFramesRef = useRef(0);
+  const advanceInputFrameRef = useRef<() => void>(() => {});
+  const releaseAllInputKeysRef = useRef<() => void>(() => {});
+  const resendProgramsRef = useRef<() => void>(() => {});
+  const keyboardKeysRef = useRef<Map<string, [number, number]>>(new Map());
+  const suppressSaveRef = useRef(false);
+
+  // Keep backendTypeRef in sync
+  useEffect(() => {
+    backendTypeRef.current = backendType;
+  }, [backendType]);
+
+  useEffect(() => {
+    const handleStart = (event: Event) => {
+      const { name } = (event as CustomEvent<{ name?: string }>).detail ?? {};
+      setTransferStatus(`Sending ${name || "file"} to the calculator…`);
+    };
+    const handleStarted = (event: Event) => {
+      const { names } = (event as CustomEvent<{ names?: string[] }>).detail ?? {};
+      const label = names?.join(", ") || "File";
+      setTransferStatus(
+        `${label} handed to CEmu. The calculator should begin receiving it shortly.`,
+      );
+      setError(null);
+    };
+    const handleProgress = (event: Event) => {
+      const { name, value, total } = (event as CustomEvent<{
+        name?: string;
+        value: number;
+        total: number;
+      }>).detail;
+      const percent = total > 0 ? Math.min(100, Math.round((value / total) * 100)) : 0;
+      setTransferStatus(
+        total > 0
+          ? `Sending ${name || "file"}: ${percent}%`
+          : `Sending ${name || "file"}…`,
+      );
+      if (total > 0 && value >= total) {
+        setTransferStatus(`${name || "File"} transferred successfully.`);
+      }
+    };
+    const handleError = (event: Event) => {
+      const { name } = (event as CustomEvent<{ name?: string }>).detail ?? {};
+      setTransferStatus(null);
+      setError(`CEmu could not transfer ${name || "the selected file"}.`);
+    };
+
+    window.addEventListener("cemu-transfer-start", handleStart);
+    window.addEventListener("cemu-transfer-started", handleStarted);
+    window.addEventListener("cemu-transfer-progress", handleProgress);
+    window.addEventListener("cemu-transfer-error", handleError);
+    return () => {
+      window.removeEventListener("cemu-transfer-start", handleStart);
+      window.removeEventListener("cemu-transfer-started", handleStarted);
+      window.removeEventListener("cemu-transfer-progress", handleProgress);
+      window.removeEventListener("cemu-transfer-error", handleError);
+    };
+  }, []);
+
+  // Save state helper
+  const saveState = useCallback(async () => {
+    const backend = backendRef.current;
+    const storage = storageRef.current;
+    const romHash = romHashRef.current;
+
+    if (
+      suppressSaveRef.current ||
+      !backend ||
+      !storage ||
+      !romHash ||
+      !romLoaded
+    )
+      return;
+
+    try {
+      const t0 = performance.now();
+      const stateData = backend.saveState();
+      const t1 = performance.now();
+      if (stateData) {
+        await storage.saveState(romHash, stateData, backendTypeRef.current);
+        const t2 = performance.now();
+        console.log(
+          `[State] snapshot: ${(t1 - t0).toFixed(1)}ms (${(stateData.length / 1024 / 1024).toFixed(1)}MB), ` +
+            `IndexedDB write: ${(t2 - t1).toFixed(1)}ms, total: ${(t2 - t0).toFixed(1)}ms`,
+        );
+      }
+    } catch (err) {
+      console.error("[State] Failed to save state:", err);
+    }
+  }, [romLoaded]);
+
+  // Initialize backend
+  useEffect(() => {
+    let cancelled = false;
+    const oldBackend = backendRef.current;
+    const oldAnimation = animationRef.current;
+
+    // Clean up old backend synchronously
+    if (oldAnimation) {
+      cancelAnimationFrame(oldAnimation);
+      animationRef.current = 0;
+    }
+    releaseAllInputKeysRef.current();
+    if (oldBackend) {
+      oldBackend.destroy();
+    }
+    backendRef.current = null;
+
+    console.log("[Init] useEffect fired, oldBackend:", !!oldBackend);
+
+    const initBackend = async () => {
+      setInitialized(false);
+      setRomLoaded(false);
+      setIsRunning(false);
+      setError(null);
+
+      try {
+        // Initialize storage
+        const storage = await getStateStorage();
+        storageRef.current = storage;
+
+        const backend = createBackend(backendType);
+        await backend.init();
+
+        if (cancelled) {
+          // Don't call destroy()/free() here — the WASM allocator may reuse
+          // the freed pointer for the next WasmEmu, corrupting its borrow state.
+          // The FinalizationRegistry will clean up the orphaned object safely.
+          return;
+        }
+
+        backendRef.current = backend;
+        setBackendName(backend.name);
+        setInitialized(true);
+
+        // Helper to load ROM into the backend with state restore
+        const loadRomIntoBackend = async (data: Uint8Array) => {
+          if (cancelled) return;
+
+          const romHash = await storage.getRomHash(data);
+          romHashRef.current = romHash;
+
+          let currentBackend = backend;
+          const result = await currentBackend.loadRom(data);
+          if (cancelled) return;
+
+          if (result === 0) {
+            let stateRestored = false;
+            try {
+              const savedState = await storage.loadState(romHash, backendType);
+              console.log(
+                "[State] savedState:",
+                savedState ? `${savedState.length} bytes` : "none",
+              );
+              if (savedState) {
+                if (currentBackend.loadState(savedState)) {
+                  stateRestored = true;
+                  console.log(
+                    "[State] restored, lcdOn:",
+                    currentBackend.isLcdOn(),
+                    "backend:",
+                    currentBackend.name,
+                  );
+                } else {
+                  console.warn("[State] Discarding incompatible saved state");
+                  await storage.deleteState(romHash, backendType);
+                }
+              }
+            } catch (e) {
+              console.warn(
+                "[State] Failed to restore state, clearing stale data:",
+                e,
+              );
+              await storage.deleteState(romHash, backendType).catch(() => {});
+
+              // Backend may be poisoned after a WASM panic — recreate it
+              try {
+                currentBackend.destroy();
+                const freshBackend = createBackend(backendType);
+                await freshBackend.init();
+                if (cancelled) return;
+                const reloadResult = await freshBackend.loadRom(data);
+                if (reloadResult !== 0) {
+                  if (!cancelled)
+                    setError(
+                      `Failed to reload ROM: error code ${reloadResult}`,
+                    );
+                  return;
+                }
+                currentBackend = freshBackend;
+                backendRef.current = freshBackend;
+                setBackendName(freshBackend.name);
+              } catch (retryErr) {
+                console.error(
+                  "[State] Failed to recreate backend after state restore failure:",
+                  retryErr,
+                );
+                if (!cancelled)
+                  setError(`Backend recovery failed: ${retryErr}`);
+                return;
+              }
+            }
+            if (!cancelled) {
+              setRomLoaded(true);
+              setIsRunning(true);
+              // Auto power-on only on fresh boot (no saved state)
+              if (!stateRestored && !currentBackend.isLcdOn()) {
+                currentBackend.setKey(2, 0, true);
+                setTimeout(() => currentBackend.setKey(2, 0, false), 300);
+              }
+
+              // Auto-launch key sequence if specified (e.g., for chess mode)
+              // Only run on fresh boot (no saved state)
+              if (autoLaunch) {
+                console.log("[AutoLaunch] Starting visual polling...");
+                const startTime = performance.now();
+                let launched = false;
+
+                const checkScreen = () => {
+                  if (launched) return;
+
+                  const elapsed = performance.now() - startTime;
+                  if (elapsed > 2000) {
+                    console.log("[AutoLaunch] Timeout - stopping polling");
+                    return;
+                  }
+
+                  const canvas = canvasRef.current;
+                  if (!canvas) {
+                    setTimeout(checkScreen, 50);
+                    return;
+                  }
+
+                  const ctx = canvas.getContext("2d");
+                  if (!ctx) {
+                    setTimeout(checkScreen, 50);
+                    return;
+                  }
+
+                  // Get single pixel at battery location (310, 10)
+                  const imageData = ctx.getImageData(310, 10, 1, 1);
+                  const r = imageData.data[0];
+                  const g = imageData.data[1];
+                  const b = imageData.data[2];
+                  const hasGreenBattery = g > 150 && g > r + 30 && g > b + 30;
+
+                  // If green battery pixel found, homescreen is ready
+                  if (hasGreenBattery) {
+                    console.log(
+                      "[AutoLaunch] Green battery detected - screen ready, executing key sequence",
+                    );
+                    launched = true;
+
+                    // Press P twice (clear message + open programs)
+                    currentBackend.setKey(4, 6, true);
+                    setTimeout(() => currentBackend.setKey(4, 6, false), 50);
+                    setTimeout(() => {
+                      currentBackend.setKey(4, 6, true);
+                      setTimeout(() => currentBackend.setKey(4, 6, false), 50);
+                    }, 100);
+
+                    // Wait 50ms, press 2
+                    setTimeout(() => {
+                      currentBackend.setKey(4, 1, true);
+                      setTimeout(() => currentBackend.setKey(4, 1, false), 50);
+                    }, 250);
+
+                    // Wait 50ms, press Enter
+                    setTimeout(() => {
+                      currentBackend.setKey(6, 0, true);
+                      setTimeout(() => currentBackend.setKey(6, 0, false), 50);
+                    }, 350);
+                  } else {
+                    console.log(
+                      "[AutoLaunch] No green battery pixel found, retrying in 50ms...",
+                    );
+                    setTimeout(checkScreen, 50);
+                  }
+                };
+
+                setTimeout(checkScreen, 100);
+              }
+            }
+          } else {
+            if (!cancelled) {
+              setError(
+                `Failed to load ROM with ${currentBackend.name}: error code ${result}`,
+              );
+            }
+          }
+        };
+
+        if (romDataRef.current) {
+          await loadRomIntoBackend(romDataRef.current);
+        } else if (useBundledRom) {
+          const romLoader = customRomLoader || loadBundledRom;
+          const bundledData = await romLoader();
+          if (bundledData && !cancelled) {
+            romDataRef.current = bundledData;
+            await loadRomIntoBackend(bundledData);
+          }
+        }
+      } catch (err) {
+        if (!cancelled) {
+          setError(`Failed to initialize ${backendType} backend: ${err}`);
+        }
+      }
+    };
+
+    initBackend();
+
+    return () => {
+      cancelled = true;
+      releaseAllInputKeysRef.current();
+      if (animationRef.current) {
+        cancelAnimationFrame(animationRef.current);
+        animationRef.current = 0;
+      }
+      // Destroy backend on unmount/re-run — next effect invocation
+      // will also destroy via oldBackend above, but this covers final unmount.
+      if (backendRef.current) {
+        backendRef.current.destroy();
+        backendRef.current = null;
+      }
+    };
+  }, [backendType, useBundledRom, customRomLoader, autoLaunch]);
+
+  // Debounced save — triggers 500ms after the last keypress
+  const saveTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
+  const debouncedSave = useCallback(() => {
+    if (saveTimerRef.current) clearTimeout(saveTimerRef.current);
+    saveTimerRef.current = setTimeout(() => {
+      saveState();
+      saveTimerRef.current = null;
+    }, 500);
+  }, [saveState]);
+
+  const removeActiveKey = useCallback((entry: ActiveKeyPress) => {
+    const entries = activeKeysRef.current.get(entry.id);
+    if (!entries) return;
+
+    const remaining = entries.filter((candidate) => candidate !== entry);
+    if (remaining.length === 0) {
+      activeKeysRef.current.delete(entry.id);
+    } else {
+      activeKeysRef.current.set(entry.id, remaining);
+    }
+  }, []);
+
+  const finishInputKey = useCallback(
+    (entry: ActiveKeyPress) => {
+      if (currentInputRef.current !== entry) return;
+
+      try {
+        entry.backend.setKey(entry.row, entry.col, false);
+      } catch {
+        // The backend can be destroyed while a delayed release is pending.
+      }
+
+      currentInputRef.current = null;
+      removeActiveKey(entry);
+      debouncedSave();
+      const isCommandKey =
+        entry.row === 6 && (entry.col === 0 || entry.col === 6);
+      inputGapFramesRef.current = isCommandKey
+        ? COMMAND_KEY_GAP_FRAMES
+        : MIN_KEY_GAP_FRAMES;
+    },
+    [debouncedSave, removeActiveKey],
+  );
+
+  const maybeFinishInputKey = useCallback(
+    (entry: ActiveKeyPress) => {
+      if (
+        currentInputRef.current !== entry ||
+        !entry.releaseRequested ||
+        entry.framesHeld < MIN_KEY_HOLD_FRAMES
+      ) {
+        return;
+      }
+
+      finishInputKey(entry);
+    },
+    [finishInputKey],
+  );
+
+  const pumpInputQueue = useCallback(() => {
+    if (currentInputRef.current || inputGapFramesRef.current > 0) return;
+
+    let entry = inputQueueRef.current.shift();
+    while (entry) {
+      const entries = activeKeysRef.current.get(entry.id);
+      if (!entries?.includes(entry)) {
+        entry = inputQueueRef.current.shift();
+        continue;
+      }
+
+      currentInputRef.current = entry;
+      try {
+        entry.backend.setKey(entry.row, entry.col, true);
+      } catch {
+        currentInputRef.current = null;
+        removeActiveKey(entry);
+        entry = inputQueueRef.current.shift();
+        continue;
+      }
+      return;
+    }
+  }, [removeActiveKey]);
+
+  const advanceInputFrame = useCallback(() => {
+    const current = currentInputRef.current;
+    if (current) {
+      current.framesHeld += 1;
+      maybeFinishInputKey(current);
+      return;
+    }
+
+    if (inputGapFramesRef.current > 0) {
+      inputGapFramesRef.current -= 1;
+    }
+    if (inputGapFramesRef.current === 0) {
+      pumpInputQueue();
+    }
+  }, [maybeFinishInputKey, pumpInputQueue]);
+
+  useEffect(() => {
+    advanceInputFrameRef.current = advanceInputFrame;
+  }, [advanceInputFrame]);
+
+  const pressInputKey = useCallback(
+    (row: number, col: number, sourceId = `pointer:${row}:${col}`) => {
+      const backend = backendRef.current;
+      if (!backend) return;
+
+      const id = sourceId;
+      const entries = activeKeysRef.current.get(id) ?? [];
+      if (entries.some((entry) => !entry.releaseRequested)) return;
+
+      const entry: ActiveKeyPress = {
+        id,
+        row,
+        col,
+        backend,
+        framesHeld: 0,
+        releaseRequested: false,
+      };
+      entries.push(entry);
+      activeKeysRef.current.set(id, entries);
+      inputQueueRef.current.push(entry);
+      pumpInputQueue();
+    },
+    [pumpInputQueue],
+  );
+
+  const releaseInputKey = useCallback(
+    (row: number, col: number, sourceId = `pointer:${row}:${col}`) => {
+      const entries = activeKeysRef.current.get(sourceId);
+      const entry = entries?.find((candidate) => !candidate.releaseRequested);
+      if (!entry) return;
+
+      entry.releaseRequested = true;
+      maybeFinishInputKey(entry);
+    },
+    [maybeFinishInputKey],
+  );
+
+  const releaseAllInputKeys = useCallback(() => {
+    for (const entries of activeKeysRef.current.values()) {
+      for (const entry of entries) {
+        if (currentInputRef.current === entry) {
+          try {
+            entry.backend.setKey(entry.row, entry.col, false);
+          } catch {
+            // The backend can already be gone during effect cleanup.
+          }
+        }
+      }
+    }
+
+    activeKeysRef.current.clear();
+    inputQueueRef.current = [];
+    currentInputRef.current = null;
+    inputGapFramesRef.current = 0;
+    keyboardKeysRef.current.clear();
+  }, []);
+
+  useEffect(() => {
+    releaseAllInputKeysRef.current = releaseAllInputKeys;
+  }, [releaseAllInputKeys]);
+
+  // Auto-save on visibility change and page unload
+  useEffect(() => {
+    const handleVisibilityChange = () => {
+      if (document.visibilityState === "hidden") {
+        releaseAllInputKeys();
+        saveState();
+      }
+    };
+
+    const handleBeforeUnload = () => {
+      releaseAllInputKeys();
+      saveState();
+    };
+
+    const handlePageHide = () => {
+      releaseAllInputKeys();
+      saveState();
+    };
+
+    const autoSaveInterval = setInterval(() => saveState(), 10_000);
+
+    document.addEventListener("visibilitychange", handleVisibilityChange);
+    window.addEventListener("blur", releaseAllInputKeys);
+    window.addEventListener("beforeunload", handleBeforeUnload);
+    window.addEventListener("pagehide", handlePageHide);
+
+    return () => {
+      document.removeEventListener("visibilitychange", handleVisibilityChange);
+      window.removeEventListener("blur", releaseAllInputKeys);
+      window.removeEventListener("beforeunload", handleBeforeUnload);
+      window.removeEventListener("pagehide", handlePageHide);
+      clearInterval(autoSaveInterval);
+      if (saveTimerRef.current) clearTimeout(saveTimerRef.current);
+      releaseAllInputKeys();
+    };
+  }, [releaseAllInputKeys, saveState]);
+
+  // Handle ROM file loading
+  const handleRomLoad = useCallback(async (file: File) => {
+    releaseAllInputKeys();
+
+    const backend = backendRef.current;
+    const storage = storageRef.current;
+    if (!backend || !storage) return;
+
+    try {
+      const buffer = await file.arrayBuffer();
+      const data = new Uint8Array(buffer);
+      console.log(`[ROM] File read: ${data.length} bytes`);
+      romDataRef.current = data; // Store for backend switching
+
+      // Compute ROM hash for state persistence
+      const romHash = await storage.getRomHash(data);
+      romHashRef.current = romHash;
+      console.log(`[ROM] Hash: ${romHash}`);
+
+      // Clear all saved states to avoid stale format mismatches
+      await storage.clearAllStates().catch(() => {});
+
+      // Create a fresh backend instance to avoid poisoned WASM state
+      console.log("[ROM] Creating fresh backend...");
+      backend.destroy();
+      const freshBackend = createBackend(backendTypeRef.current);
+      await freshBackend.init();
+      backendRef.current = freshBackend;
+      console.log("[ROM] Fresh backend ready, calling loadRom...");
+
+      const result = await freshBackend.loadRom(data);
+      console.log(`[ROM] loadRom returned: ${result}`);
+
+      if (result === 0) {
+        console.log("ROM loaded successfully, waiting for ON key press...");
+
+        setRomLoaded(true);
+        setIsRunning(true); // Auto-start
+        setError(null);
+      } else {
+        setError(`Failed to load ROM: error code ${result}`);
+      }
+    } catch (err) {
+      console.error("[ROM] Error during load:", err);
+      if (err instanceof Error) {
+        console.error("[ROM] Stack:", err.stack);
+      }
+      setError(`Failed to read ROM file: ${err}`);
+    }
+  }, [releaseAllInputKeys]);
+
+  // Render frame to canvas
+  const renderFrame = useCallback(() => {
+    const backend = backendRef.current;
+    const canvas = canvasRef.current;
+    if (!backend || !canvas) return;
+
+    try {
+      const ctx = canvas.getContext("2d");
+      if (!ctx) return;
+
+      const width = backend.getFramebufferWidth();
+      const height = backend.getFramebufferHeight();
+
+      // Show black screen when LCD is off (sleeping or disabled)
+      if (!backend.isLcdOn()) {
+        ctx.fillStyle = "#000";
+        ctx.fillRect(0, 0, width, height);
+        return;
+      }
+
+      // Get framebuffer as RGBA
+      const rgba = backend.getFramebufferRGBA();
+
+      // Create ImageData and draw - copy into a new Uint8ClampedArray
+      const clampedData = new Uint8ClampedArray(rgba.length);
+      clampedData.set(rgba);
+      const imageData = new ImageData(clampedData, width, height);
+      ctx.putImageData(imageData, 0, 0);
+    } catch (e) {
+      // Backend was destroyed during render - safe to ignore
+      console.warn("Render error (safe to ignore during backend switch):", e);
+    }
+  }, []);
+
+  // Update speed ref when speed changes
+  useEffect(() => {
+    speedRef.current = speed;
+  }, [speed]);
+
+  // Main emulation loop
+  useEffect(() => {
+    if (!isRunning || !romLoaded || !backendRef.current) return;
+
+    let slowFrameCount = 0;
+    let totalFrames = 0;
+    let timeAccumulator = 0;
+    let lastLoopTime = 0;
+    const TARGET_FRAME_MS = 1000 / 60; // 16.67ms per emulated frame
+
+    const loop = (timestamp: number) => {
+      const backend = backendRef.current;
+      if (!backend) return;
+
+      // Time-accumulator approach: track how much real time has passed
+      // and run exactly that many emulated frames (scaled by speed).
+      // This ensures precise 60fps regardless of display refresh rate.
+      // Turbo mode: temporarily boost speed during boot after live file send
+      const turbo = performance.now() < turboUntilRef.current;
+      const effectiveSpeed = turbo ? 20 : speedRef.current;
+      const maxFramesPerTick = turbo ? 30 : 4;
+
+      if (lastLoopTime > 0) {
+        let delta = timestamp - lastLoopTime;
+        // Clamp delta to avoid spiral of death after tab suspension
+        if (delta > 200) delta = TARGET_FRAME_MS;
+        timeAccumulator += delta * effectiveSpeed;
+      }
+      lastLoopTime = timestamp;
+
+      try {
+        // Run one emulated frame per 16.67ms of accumulated time
+        let framesThisTick = 0;
+        while (timeAccumulator >= TARGET_FRAME_MS) {
+          const t0 = performance.now();
+          backend.runFrame();
+          advanceInputFrameRef.current();
+          const elapsed = performance.now() - t0;
+          totalFrames++;
+          framesThisTick++;
+          timeAccumulator -= TARGET_FRAME_MS;
+
+          // Detect slow frames (>100ms means we're blocking the UI thread)
+          if (elapsed > 100) {
+            slowFrameCount++;
+            if (slowFrameCount <= 5 || slowFrameCount % 50 === 0) {
+              console.warn(
+                `[EMU] Slow frame #${slowFrameCount}: ${elapsed.toFixed(0)}ms (frame ${totalFrames})`,
+              );
+            }
+          } else {
+            if (slowFrameCount > 0) {
+              console.log(
+                `[EMU] Recovered after ${slowFrameCount} slow frames`,
+              );
+            }
+            slowFrameCount = 0;
+          }
+
+          // Safety: cap frames per rAF to avoid blocking UI
+          if (framesThisTick >= maxFramesPerTick) {
+            timeAccumulator = 0;
+            break;
+          }
+        }
+
+        // Render if we ran at least one frame
+        if (framesThisTick > 0) {
+          renderFrame();
+        }
+      } catch (e) {
+        // Backend was destroyed during frame - safe to ignore
+        console.warn("Frame error (safe to ignore during backend switch):", e);
+        return;
+      }
+
+      // Calculate FPS (count emulated frames rendered to screen)
+      frameCount.current++;
+      const now = performance.now();
+      if (now - lastFrameTime.current >= 1000) {
+        setFps(frameCount.current);
+        frameCount.current = 0;
+        lastFrameTime.current = now;
+      }
+
+      animationRef.current = requestAnimationFrame(loop);
+    };
+
+    lastFrameTime.current = performance.now();
+    frameCount.current = 0;
+    animationRef.current = requestAnimationFrame(loop);
+
+    return () => {
+      if (animationRef.current) {
+        cancelAnimationFrame(animationRef.current);
+      }
+    };
+  }, [isRunning, romLoaded, renderFrame]);
+
+  // Keyboard event handling
+  useEffect(() => {
+    if (!backendRef.current || !romLoaded) return;
+
+    // Track if Shift was pressed alone (for 2nd key)
+    let shiftPressedAlone = false;
+
+    const handleKeyDown = (e: KeyboardEvent) => {
+      // Control shortcuts
+      if (e.key === " ") {
+        e.preventDefault();
+        if (e.repeat) return;
+        setIsRunning((prev) => !prev);
+        return;
+      }
+
+      // Track Shift for 2nd key - only trigger on release if pressed alone
+      if (e.key === "Shift") {
+        if (e.repeat) return;
+        shiftPressedAlone = true;
+        return;
+      }
+
+      // If any other key is pressed while Shift is held, it's not a solo Shift press
+      if (e.shiftKey) {
+        shiftPressedAlone = false;
+      }
+
+      // Special combo keys (2nd + key sequences)
+      if (e.key === "v" || e.key === "V") {
+        e.preventDefault();
+        if (e.repeat) return;
+        // Square root: 2nd + x²
+        pressInputKey(1, 5, "synthetic:sqrt:2nd");
+        releaseInputKey(1, 5, "synthetic:sqrt:2nd");
+        pressInputKey(2, 4, "synthetic:sqrt:square");
+        releaseInputKey(2, 4, "synthetic:sqrt:square");
+        return;
+      }
+
+      // Shift+R: clear saved state and reload page (hard refresh for dev)
+      if (e.shiftKey && (e.key === "r" || e.key === "R")) {
+        e.preventDefault();
+        suppressSaveRef.current = true;
+        releaseAllInputKeys();
+        const storage = storageRef.current;
+        const romHash = romHashRef.current;
+        if (storage && romHash) {
+          storage
+            .deleteState(romHash, backendTypeRef.current)
+            .then(() => {
+              console.log("[State] Cleared saved state, reloading...");
+              window.location.reload();
+            })
+            .catch(() => {
+              // Even if delete fails, still reload
+              window.location.reload();
+            });
+        } else {
+          window.location.reload();
+        }
+        return;
+      }
+
+      // Ctrl+R / Cmd+R: resend last program files (override browser refresh)
+      if ((e.ctrlKey || e.metaKey) && e.key === "r") {
+        if (
+          programHandlesRef.current.length > 0 ||
+          programDataRef.current.length > 0
+        ) {
+          e.preventDefault();
+          resendProgramsRef.current();
+          return;
+        }
+      }
+
+      // Don't intercept browser shortcuts (Ctrl/Cmd + key)
+      if (e.ctrlKey || e.metaKey) {
+        return;
+      }
+
+      const mapping = KEY_MAP[e.key];
+      if (mapping) {
+        e.preventDefault();
+        if (!keyboardKeysRef.current.has(e.code)) {
+          keyboardKeysRef.current.set(e.code, mapping);
+          pressInputKey(mapping[0], mapping[1], `keyboard:${e.code}`);
+        }
+      }
+    };
+
+    const handleKeyUp = (e: KeyboardEvent) => {
+      // Handle Shift release - trigger 2nd only if it was pressed alone
+      if (e.key === "Shift") {
+        if (shiftPressedAlone) {
+          // Tap 2nd key (press and release)
+          pressInputKey(1, 5);
+          releaseInputKey(1, 5);
+        }
+        shiftPressedAlone = false;
+        return;
+      }
+
+      const mapping = keyboardKeysRef.current.get(e.code);
+      if (mapping) {
+        e.preventDefault();
+        keyboardKeysRef.current.delete(e.code);
+        releaseInputKey(mapping[0], mapping[1], `keyboard:${e.code}`);
+      }
+    };
+
+    window.addEventListener("keydown", handleKeyDown);
+    window.addEventListener("keyup", handleKeyUp);
+
+    return () => {
+      window.removeEventListener("keydown", handleKeyDown);
+      window.removeEventListener("keyup", handleKeyUp);
+      releaseAllInputKeys();
+    };
+  }, [
+    romLoaded,
+    backendType,
+    pressInputKey,
+    releaseInputKey,
+    releaseAllInputKeys,
+  ]);
+
+  const handleFileChange = (e: React.ChangeEvent<HTMLInputElement>) => {
+    const file = e.target.files?.[0];
+    if (file) {
+      handleRomLoad(file);
+    }
+  };
+
+  const handleReset = async () => {
+    releaseAllInputKeys();
+
+    const storage = storageRef.current;
+    const romHash = romHashRef.current;
+
+    if (storage && romHash) {
+      try {
+        await storage.deleteState(romHash, backendTypeRef.current);
+        console.log("[State] Cleared saved state for reset");
+      } catch (err) {
+        console.warn("[State] Failed to delete state during reset:", err);
+      }
+    }
+
+    if (backendRef.current) {
+      backendRef.current.reset();
+    }
+  };
+
+  const handleEjectRom = async () => {
+    releaseAllInputKeys();
+
+    // Save state before ejecting
+    await saveState();
+
+    setIsRunning(false);
+    setRomLoaded(false);
+    romDataRef.current = null;
+    romHashRef.current = null;
+    if (backendRef.current) {
+      backendRef.current.reset();
+    }
+  };
+
+  // Core logic for injecting .8xp/.8xv program files
+  const loadProgramFiles = useCallback(async (files: File[]) => {
+    if (files.length === 0) return;
+
+    releaseAllInputKeys();
+
+    const romData = romDataRef.current;
+    if (!romData) {
+      setError("Load a ROM first before sending program files");
+      return;
+    }
+
+    // Read all selected files
+    const fileEntries: { name: string; data: Uint8Array }[] = [];
+    for (const file of files) {
+      const buffer = await file.arrayBuffer();
+      fileEntries.push({ name: file.name, data: new Uint8Array(buffer) });
+    }
+
+    const backend = backendRef.current;
+
+    // Live path: emulator is already running — inject + soft reboot in-place
+    if (backend?.isRomLoaded) {
+      try {
+        let totalInjected = 0;
+        const succeeded: typeof fileEntries = [];
+        const failed: string[] = [];
+        for (const entry of fileEntries) {
+          const count = backend.sendFileLive(entry.data, entry.name);
+          if (count >= 0) {
+            totalInjected += count;
+            succeeded.push(entry);
+            console.log(
+              `[Program Live] Injected ${entry.name}: ${count} entries`,
+            );
+          } else {
+            failed.push(`${entry.name} (${count})`);
+            console.error(
+              `[Program Live] Failed to inject ${entry.name}: error ${count}`,
+            );
+          }
+        }
+        console.log(
+          `[Program Live] Total entries injected: ${totalInjected}, soft reboot done`,
+        );
+        programDataRef.current = succeeded;
+        setProgramFiles(succeeded.map((entry) => entry.name));
+        if (failed.length > 0) {
+          setError(`Failed to inject program files: ${failed.join(", ")}`);
+        } else {
+          // Turbo-speed through boot — slightly undershot so user doesn't notice
+          turboUntilRef.current = performance.now() + 300;
+          setError(null);
+        }
+      } catch (err) {
+        console.error("[Program Live] Error:", err);
+        setError(`Failed to live-send programs: ${err}`);
+      }
+      return;
+    }
+
+    // Cold boot path: no emulator running — create fresh backend
+    setIsRunning(false);
+    setRomLoaded(false);
+    if (animationRef.current) {
+      cancelAnimationFrame(animationRef.current);
+      animationRef.current = 0;
+    }
+
+    try {
+      // Create fresh backend, load ROM, inject files, then boot
+      const oldBackend = backendRef.current;
+      if (oldBackend) oldBackend.destroy();
+
+      const freshBackend = createBackend(backendTypeRef.current);
+      await freshBackend.init();
+      backendRef.current = freshBackend;
+
+      const result = await freshBackend.loadRom(romData);
+      if (result !== 0) {
+        setError(`Failed to reload ROM: error code ${result}`);
+        return;
+      }
+
+      // Inject each program file
+      let totalInjected = 0;
+      const succeeded: typeof fileEntries = [];
+      const failed: string[] = [];
+      for (const entry of fileEntries) {
+        const count = freshBackend.sendFile(entry.data, entry.name);
+        if (count >= 0) {
+          totalInjected += count;
+          succeeded.push(entry);
+          console.log(`[Program] Injected ${entry.name}: ${count} entries`);
+        } else {
+          failed.push(`${entry.name} (${count})`);
+          console.error(
+            `[Program] Failed to inject ${entry.name}: error ${count}`,
+          );
+        }
+      }
+
+      console.log(`[Program] Total entries injected: ${totalInjected}`);
+
+      // Start animation loop, then press ON key to power on.
+      // We use setKey instead of powerOn() because powerOn() does press+release
+      // with zero cycles in between, leaving a stale irq_pending that causes
+      // a spurious interrupt during boot. setKey + delayed release matches
+      // the normal user flow (hold ON, boot runs, release ON).
+      setRomLoaded(true);
+      setIsRunning(true);
+      programDataRef.current = succeeded;
+      setProgramFiles(succeeded.map((entry) => entry.name));
+      setError(
+        failed.length > 0
+          ? `Failed to inject program files: ${failed.join(", ")}`
+          : null,
+      );
+      freshBackend.setKey(2, 0, true); // ON key press → powered_on = true
+      setTimeout(() => freshBackend.setKey(2, 0, false), 300); // Release after boot starts
+    } catch (err) {
+      console.error("[Program] Error:", err);
+      setError(`Failed to load programs: ${err}`);
+    }
+  }, [releaseAllInputKeys]);
+
+  // Resend last program files — re-reads from disk via FileSystemFileHandle if available
+  const resendPrograms = useCallback(async () => {
+    const backend = backendRef.current;
+    if (!backend?.isRomLoaded) return;
+
+    const handles = programHandlesRef.current;
+    if (handles.length > 0) {
+      // Re-read fresh bytes from disk
+      try {
+        let totalInjected = 0;
+        const failed: string[] = [];
+        for (const handle of handles) {
+          const file = await handle.getFile();
+          const data = new Uint8Array(await file.arrayBuffer());
+          const count = backend.sendFileLive(data, file.name);
+          if (count >= 0) {
+            totalInjected += count;
+            console.log(`[Resend] Injected ${file.name}: ${count} entries`);
+          } else {
+            failed.push(`${file.name} (${count})`);
+            console.error(
+              `[Resend] Failed to inject ${file.name}: error ${count}`,
+            );
+          }
+        }
+        console.log(
+          `[Resend] Total entries injected: ${totalInjected}, soft reboot done`,
+        );
+        if (failed.length > 0) {
+          setError(`Failed to resend program files: ${failed.join(", ")}`);
+        } else {
+          turboUntilRef.current = performance.now() + 300;
+          setError(null);
+        }
+      } catch (err) {
+        console.error("[Resend] Error:", err);
+        setError(`Failed to resend programs: ${err}`);
+      }
+      return;
+    }
+
+    // Fallback: resend cached data
+    const cached = programDataRef.current;
+    if (cached.length > 0) {
+      try {
+        let totalInjected = 0;
+        const failed: string[] = [];
+        for (const entry of cached) {
+          const count = backend.sendFileLive(entry.data, entry.name);
+          if (count >= 0) {
+            totalInjected += count;
+            console.log(
+              `[Resend] Injected ${entry.name}: ${count} entries (cached)`,
+            );
+          } else {
+            failed.push(`${entry.name} (${count})`);
+            console.error(
+              `[Resend] Failed to inject ${entry.name}: error ${count}`,
+            );
+          }
+        }
+        console.log(
+          `[Resend] Total entries injected: ${totalInjected}, soft reboot done`,
+        );
+        if (failed.length > 0) {
+          setError(`Failed to resend program files: ${failed.join(", ")}`);
+        } else {
+          turboUntilRef.current = performance.now() + 300;
+          setError(null);
+        }
+      } catch (err) {
+        console.error("[Resend] Error:", err);
+        setError(`Failed to resend programs: ${err}`);
+      }
+    }
+  }, []);
+
+  useEffect(() => {
+    resendProgramsRef.current = resendPrograms;
+  }, [resendPrograms]);
+
+  // Handle file input change for .8xp/.8xv programs
+  const handleProgramFiles = useCallback(
+    async (e: React.ChangeEvent<HTMLInputElement>) => {
+      const files = e.target.files;
+      if (!files || files.length === 0) return;
+      await loadProgramFiles(Array.from(files));
+      // Reset the file input so the same files can be re-selected
+      e.target.value = "";
+    },
+    [loadProgramFiles],
+  );
+
+  const handleDragEnter = useCallback((e: React.DragEvent) => {
+    e.preventDefault();
+    e.stopPropagation();
+    dragCounterRef.current++;
+    if (dragCounterRef.current === 1) {
+      setIsDragging(true);
+    }
+  }, []);
+
+  const handleDragLeave = useCallback((e: React.DragEvent) => {
+    e.preventDefault();
+    e.stopPropagation();
+    dragCounterRef.current--;
+    if (dragCounterRef.current === 0) {
+      setIsDragging(false);
+    }
+  }, []);
+
+  const handleDragOver = useCallback((e: React.DragEvent) => {
+    e.preventDefault();
+    e.stopPropagation();
+  }, []);
+
+  const handleDrop = useCallback(
+    async (e: React.DragEvent) => {
+      e.preventDefault();
+      e.stopPropagation();
+      dragCounterRef.current = 0;
+      setIsDragging(false);
+
+      const files = Array.from(e.dataTransfer.files);
+      if (files.length === 0) return;
+
+      const romFiles: File[] = [];
+      const programFilesList: File[] = [];
+
+      // Try to capture FileSystemFileHandles for program files (Chromium only)
+      const handles: FileSystemFileHandle[] = [];
+      const items = Array.from(e.dataTransfer.items);
+
+      for (let i = 0; i < files.length; i++) {
+        const file = files[i];
+        const name = file.name.toLowerCase();
+        if (ROM_EXTENSIONS.some((ext) => name.endsWith(ext))) {
+          romFiles.push(file);
+        } else if (PROGRAM_EXTENSIONS.some((ext) => name.endsWith(ext))) {
+          programFilesList.push(file);
+          // Try to get a persistent handle for re-reading later
+          const item = items[i];
+          if (item && "getAsFileSystemHandle" in item) {
+            try {
+              const itemWithHandle = item as DataTransferItem & {
+                getAsFileSystemHandle(): Promise<FileSystemHandle>;
+              };
+              const handle = await itemWithHandle.getAsFileSystemHandle();
+              if (handle?.kind === "file") {
+                handles.push(handle as FileSystemFileHandle);
+              }
+            } catch {
+              /* Not supported or permission denied */
+            }
+          }
+        }
+      }
+
+      // Store handles if we got them for all program files
+      if (handles.length === programFilesList.length && handles.length > 0) {
+        programHandlesRef.current = handles;
+      }
+
+      // Load ROM first if present (only use the first one)
+      if (romFiles.length > 0) {
+        await handleRomLoad(romFiles[0]);
+      }
+
+      // Then inject program files
+      if (programFilesList.length > 0) {
+        await loadProgramFiles(programFilesList);
+      }
+
+      if (romFiles.length === 0 && programFilesList.length === 0) {
+        setError("Unsupported file type. Drop a ROM or supported TI calculator file.");
+      }
+    },
+    [handleRomLoad, loadProgramFiles],
+  );
+
+  const handleBackendChange = (e: React.ChangeEvent<HTMLSelectElement>) => {
+    const newBackend = e.target.value as BackendType;
+    setBackendType(newBackend);
+  };
+
+  // Keypad handlers
+  const handleKeypadDown = useCallback((row: number, col: number) => {
+    pressInputKey(row, col);
+  }, [pressInputKey]);
+
+  const handleKeypadUp = useCallback(
+    (row: number, col: number) => {
+      releaseInputKey(row, col);
+    },
+    [releaseInputKey],
+  );
+
+  // Calculate container width based on fullscreen mode
+  const containerWidth = fullscreen
+    ? "min(420px, 95vw, calc(95vh * 0.45))"
+    : "360px";
+
+  return (
+    <div
+      className={className}
+      onDragEnter={handleDragEnter}
+      onDragLeave={handleDragLeave}
+      onDragOver={handleDragOver}
+      onDrop={handleDrop}
+      style={{
+        display: "flex",
+        flexDirection: "column",
+        alignItems: "center",
+        gap: fullscreen ? "0.5rem" : "1rem",
+        position: "relative",
+        minHeight: "200px",
+        ...(fullscreen && {
+          transform: "scale(1)",
+          transformOrigin: "center center",
+        }),
+      }}
+    >
+      {/* Drag-and-drop overlay */}
+      {isDragging && (
+        <div
+          style={{
+            position: "absolute",
+            inset: 0,
+            background: "rgba(59, 130, 246, 0.15)",
+            border: "3px dashed rgba(59, 130, 246, 0.6)",
+            borderRadius: "12px",
+            zIndex: 100,
+            display: "flex",
+            alignItems: "center",
+            justifyContent: "center",
+            pointerEvents: "none",
+          }}
+        >
+          <span
+            style={{
+              fontSize: "1.25rem",
+              fontWeight: "bold",
+              color: "rgba(59, 130, 246, 0.8)",
+              background: "rgba(255, 255, 255, 0.9)",
+              padding: "0.75rem 1.5rem",
+              borderRadius: "8px",
+            }}
+          >
+            Drop a ROM, program, app, variable, or .8eu OS update
+          </span>
+        </div>
+      )}
+      {/* Header and backend selector - only on non-demo */}
+      {!useBundledRom && (
+        <>
+          <h1>TI-84 Plus CE Emulator</h1>
+
+          <div style={{ display: "flex", gap: "1rem", alignItems: "center" }}>
+            <label htmlFor="backend-select">Backend:</label>
+            <select
+              id="backend-select"
+              value={backendType}
+              onChange={handleBackendChange}
+              disabled={isRunning}
+              style={{ padding: "0.5rem" }}
+            >
+              <option value="cemu">CEmu (files + OS updates)</option>
+              <option value="rust">Rust (program injection only)</option>
+            </select>
+            {backendName && (
+              <span style={{ fontSize: "0.875rem", color: "#666" }}>
+                Using: {backendName}
+              </span>
+            )}
+          </div>
+        </>
+      )}
+
+      {error && (
+        <div
+          style={{
+            color: "red",
+            padding: "0.5rem",
+            background: "#fee",
+            borderRadius: "4px",
+          }}
+        >
+          {error}
+        </div>
+      )}
+
+      {!initialized && !useBundledRom && (
+        <p>
+          Loading {backendType === "rust" ? "Rust WASM" : "CEmu WASM"} module...
+        </p>
+      )}
+
+      {initialized && !romLoaded && !useBundledRom && (
+        <div
+          style={{
+            padding: "1rem",
+            border: "2px dashed #ccc",
+            borderRadius: "8px",
+          }}
+        >
+          <label htmlFor="rom-input" style={{ cursor: "pointer" }}>
+            <p>Select a ROM dumped from your TI-84 Plus CE (.rom or .bin)</p>
+            <input
+              id="rom-input"
+              type="file"
+              accept=".rom,.bin"
+              onChange={handleFileChange}
+              style={{ marginTop: "0.5rem" }}
+            />
+          </label>
+        </div>
+      )}
+
+      {(romLoaded || useBundledRom) && (
+        <>
+          {/* Calculator — single combined image (bezel + keypad) */}
+          <div
+            style={{
+              boxShadow: "0 8px 24px rgba(0,0,0,0.4)",
+              width: containerWidth,
+              borderBottomLeftRadius: "48px",
+              borderBottomRightRadius: "48px",
+              borderTopLeftRadius: 56,
+              borderTopRightRadius: 56,
+              overflow: "hidden",
+              position: "relative",
+              aspectRatio: `${BODY_ASPECT_RATIO}`,
+              backgroundImage: `url(${publicAsset("buttons/calculator_body.png")})`,
+              backgroundSize: "100% 100%",
+            }}
+          >
+            {/* LCD canvas positioned within combined body */}
+            <canvas
+              ref={canvasRef}
+              width={320}
+              height={240}
+              style={{
+                position: "absolute",
+                left: `${LCD_POSITION.left}%`,
+                top: `${LCD_POSITION.top}%`,
+                width: `${LCD_POSITION.width}%`,
+                height: `${LCD_POSITION.height}%`,
+                imageRendering: "pixelated",
+              }}
+            />
+            {!romLoaded && useBundledRom && (
+              <div
+                style={{
+                  position: "absolute",
+                  left: `${LCD_POSITION.left}%`,
+                  top: `${LCD_POSITION.top}%`,
+                  width: `${LCD_POSITION.width}%`,
+                  height: `${LCD_POSITION.height}%`,
+                  display: "flex",
+                  alignItems: "center",
+                  justifyContent: "center",
+                  background: "#000",
+                  color: "#888",
+                  fontSize: "1rem",
+                  fontFamily: "system-ui, sans-serif",
+                }}
+              >
+                Loading...
+              </div>
+            )}
+
+            {/* Keypad buttons overlay (positioned over keypad portion) */}
+            <Keypad onKeyDown={handleKeypadDown} onKeyUp={handleKeypadUp} />
+          </div>
+
+          {/* Controls - outside calculator */}
+          <div
+            style={{
+              display: "flex",
+              gap: "0.75rem",
+              alignItems: "center",
+              flexWrap: "wrap",
+              justifyContent: "center",
+            }}
+          >
+            <button
+              onClick={() => setIsRunning(!isRunning)}
+              style={{ padding: "6px 16px" }}
+              title="Space"
+            >
+              {isRunning ? "Pause" : "Run"}
+            </button>
+            <button
+              onClick={handleReset}
+              style={{ padding: "6px 16px" }}
+              title="R"
+            >
+              Reset
+            </button>
+            <>
+              {!useBundledRom && (
+                <button
+                  onClick={handleEjectRom}
+                  style={{ padding: "6px 16px" }}
+                  title="E"
+                >
+                  Eject
+                </button>
+              )}
+              <button
+                onClick={() => programInputRef.current?.click()}
+                style={{ padding: "6px 16px" }}
+                title="Send programs, variables, apps, or an .8eu OS update"
+              >
+                Send File
+              </button>
+              <input
+                ref={programInputRef}
+                type="file"
+                accept=".8xp,.8xv,.8xl,.8xn,.8xm,.8xy,.8xg,.8xs,.8xd,.8xw,.8xc,.8xz,.8xt,.8ca,.8cg,.8ci,.8ek,.8yu,.8eu,.8pu"
+                multiple
+                onChange={handleProgramFiles}
+                style={{ display: "none" }}
+              />
+              {programFiles.length > 0 && (
+                <>
+                  <button
+                    onClick={resendPrograms}
+                    style={{ padding: "6px 16px" }}
+                    title="Re-read and resend last calculator files (Ctrl+R)"
+                  >
+                    Resend
+                  </button>
+                  <span style={{ fontSize: "0.75rem", color: "#888" }}>
+                    {programFiles.join(", ")}
+                  </span>
+                </>
+              )}
+            </>
+            <div
+              style={{ display: "flex", alignItems: "center", gap: "0.5rem" }}
+            >
+              <input
+                type="range"
+                min="0"
+                max={speedSteps.length - 1}
+                step="1"
+                value={speedIndex}
+                onChange={(e) => setSpeedIndex(parseInt(e.target.value))}
+                style={{ width: "80px" }}
+                title="CPU Speed"
+              />
+              <span
+                style={{
+                  fontSize: "0.75rem",
+                  color: fullscreen ? "#888" : "#666",
+                  minWidth: "2.5rem",
+                }}
+              >
+                {speed}x
+              </span>
+            </div>
+            <span
+              style={{
+                fontSize: "0.875rem",
+                color: fullscreen ? "#888" : "#666",
+              }}
+            >
+              {fps} FPS
+            </span>
+          </div>
+
+          {transferStatus && (
+            <div className="transfer-status" role="status" aria-live="polite">
+              {transferStatus}
+            </div>
+          )}
+
+          {backendType === "cemu" && (
+            <p className="transfer-help">
+              OS updates use TI&apos;s normal USB update flow. Keep this tab open,
+              follow the prompts on the calculator screen, and wait for 100%.
+              The updated flash state is saved locally in this browser.
+            </p>
+          )}
+
+          {/* Keyboard controls help */}
+          <div
+            style={{
+              fontSize: "0.75rem",
+              color: "#888",
+              maxWidth: "360px",
+              textAlign: "center",
+            }}
+          >
+            <p>
+              <strong>Keyboard Controls:</strong>
+            </p>
+            <p>
+              Numbers: 0-9 | Arrows: Navigate | Enter: Enter | Backspace: Del
+            </p>
+            <p>+, -, *, / : Math | ( ) : Parens | ^: Power | V: √</p>
+            <p>
+              Shift: 2nd | Alt: Alpha | Escape: Clear | O: ON | P: Prgm | Space:
+              Pause
+            </p>
+          </div>
+        </>
+      )}
+    </div>
+  );
+}
